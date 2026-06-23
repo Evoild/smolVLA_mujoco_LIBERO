@@ -1,0 +1,6 @@
+run,seed,suite,successes,episodes,success_rate_pct,seed_mean_pct,seed_std_pct
+smolvla_libero_4suites,unknown,libero_10,41,100,41.0,,
+smolvla_libero_4suites,unknown,libero_goal,66,100,66.0,,
+smolvla_libero_4suites,unknown,libero_object,77,100,77.0,,
+smolvla_libero_4suites,unknown,libero_spatial,77,100,77.0,,
+smolvla_libero_4suites,unknown,OVERALL,261,400,65.25,,

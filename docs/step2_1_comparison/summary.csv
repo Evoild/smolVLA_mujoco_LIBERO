@@ -1,0 +1,8 @@
+run,seed,suite,successes,episodes,success_rate_pct,seed_mean_pct,seed_std_pct
+smolvla_libero_4suites,unknown,libero_10,41,100,41.0,,
+smolvla_libero_4suites,unknown,libero_goal,66,100,66.0,,
+smolvla_libero_4suites,unknown,libero_object,77,100,77.0,,
+smolvla_libero_4suites,unknown,libero_spatial,77,100,77.0,,
+step2_1_spatial_lora_r16,unknown,libero_spatial,66,100,66.0,,
+smolvla_libero_4suites,unknown,OVERALL,261,400,65.25,,
+step2_1_spatial_lora_r16,unknown,OVERALL,66,100,66.0,,

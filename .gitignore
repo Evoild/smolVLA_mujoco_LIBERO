@@ -1,0 +1,14 @@
+runs/
+eval_results/
+smolvla_libero/
+lerobot/
+libero/
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.vscode/
+smolvla_base/
+.codex
+.agents

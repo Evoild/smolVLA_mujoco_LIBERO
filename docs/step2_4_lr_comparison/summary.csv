@@ -1,0 +1,7 @@
+run,seed,suite,successes,episodes,success_rate_pct,seed_mean_pct,seed_std_pct
+lr_1e-4_spatial,unknown,libero_spatial,78,100,78.0,,
+lr_1e-5_spatial,unknown,libero_spatial,66,100,66.0,,
+step2_1_spatial_lora_r16,unknown,libero_spatial,66,100,66.0,,
+lr_1e-4_spatial,unknown,OVERALL,78,100,78.0,,
+lr_1e-5_spatial,unknown,OVERALL,66,100,66.0,,
+step2_1_spatial_lora_r16,unknown,OVERALL,66,100,66.0,,
