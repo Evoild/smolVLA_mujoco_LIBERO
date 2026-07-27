@@ -462,3 +462,41 @@ python3 scripts/analyze_eval.py \
 组合设置比 `Rank=16、lr=1e-4、lora_only` 低 3 个百分点，并比原始 baseline 低 2 个百分点。
 这表明 Rank、学习率和冻结策略之间存在交互，单变量实验中的最佳设置不能保证组合后继续提升。
 当前实验中表现最好的配置仍是 Step 2-4 的 `Rank=16、lr=1e-4、lora_only`，成功率为 78%。
+
+# step 3: 量化部署
+
+smolvla默认各模块精度
+| 模块 | 精度 | 
+| --- | ---: | 
+| vlm_with_expert.vlm | bf16 |
+| vlm_with_expert.lm_expert | fp32 |
+| state_proj | fp32 |
+| action_in_proj | fp32 |
+| action_out_proj | fp32 |
+| action_time_mlp_in | fp32 |
+| action_time_mlp_out | fp32 |
+
+## step 3-1: baseline
+
+基于原始 `smolvla_libero` checkpoint，在 `libero_goal` 上评测成功率，并用
+`deploy/3-1baseline.sh` 测量一次 `policy.forward` 的端到端延迟、模块耗时和峰值 GPU 显存。
+
+| 方案 | 设备 | Batch | `policy.forward` 平均延迟 | P95 延迟 | FPS | 峰值显存 | 模型大小 | Success Rate |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 默认混合精度（VLM bf16，其余 fp32） | RTX 5070 Ti | 1 | 40.95 ms | 41.62 ms | 24.42 | 1.19 GB | 1.2 GB | 77.0% |
+
+模块耗时如下。这里 `unattributed` 是端到端耗时中没有归入下列 `nn.Module` hook 的部分，主要包括
+functional attention、mask 构造、tensor 拼接、loss 计算等非模块调用。
+
+| 模块 | 平均耗时 | P95 耗时 | 占端到端延迟 |
+| --- | ---: | ---: | ---: |
+| `vlm` | 15.01 ms | 15.41 ms | 36.66% |
+| `lm_expert` | 6.34 ms | 6.51 ms | 15.48% |
+| `state_proj` | 0.02 ms | 0.03 ms | 0.06% |
+| `action_in_proj` | 0.02 ms | 0.03 ms | 0.06% |
+| `action_time_mlp` | 0.05 ms | 0.05 ms | 0.11% |
+| `action_out_proj` | 0.02 ms | 0.03 ms | 0.06% |
+| `unattributed` | 19.49 ms | 19.72 ms | 47.58% |
+
+主要瓶颈是 `unattributed` 部分和 `vlm`：两者合计约占端到端 `policy.forward` 延迟的 84.24%。
+线性投影层和 action MLP 的耗时都在 0.1 ms 以下，不是当前 baseline 的主要性能瓶颈。
