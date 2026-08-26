@@ -1,0 +1,38 @@
+# --- Model checkpoints (download from HuggingFace: lerobot/smolvla_base) ---
+smolvla_base/
+
+# --- Training outputs & logs ---
+outputs/
+*.log
+
+# --- Large model / weight files (catch stray artifacts) ---
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# --- HuggingFace / download cache ---
+.cache/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# --- Secrets & local env ---
+.env
+.env.*
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

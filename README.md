@@ -124,6 +124,269 @@ lerobot-eval \
 
 # step 2: RL 微调训练
 
+本阶段目标是在现有 `SmolVLA + LIBERO` 项目中接入 `smollvla_rltoken`，完成可复现的：
+
+```text
+Frozen SmolVLA baseline
+  -> Stage 1 RL Token reconstruction training
+  -> Stage 2 Online RL training
+  -> fixed-policy LIBERO evaluation
+```
+
+不修改 Step 3 量化部署相关代码；RL 相关改动集中在 `smollvla_rltoken/` 和必要的 LIBERO 接入脚本。
+
+## step 2-0: 当前 RLT smoke test
+
+先确认 RLT 代码能加载当前项目的 LIBERO checkpoint。当前 `smolvla_libero` checkpoint 的输入输出为：
+
+- image keys：`observation.images.image`、`observation.images.image2`
+- state dim：8
+- action dim：7
+- SmolVLA reference chunk：`H=50`
+- RLT executed chunk：`C=10`
+
+已将 `smollvla_rltoken` 的 mock/smoke 路径改为从 policy config 自动读取 image keys、state dim 和 action dim，避免沿用旧 SO-100 的 `camera1/2/3`、6 维 action 假设。
+
+运行 smoke test：
+
+```bash
+cd /home/evoild/program/smolVLA_mujoco_LIBERO/smollvla_rltoken
+
+/home/evoild/miniconda3/condabin/conda run -n LIBERO-smolvla \
+  python scripts/smoke_test.py \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --device cuda
+```
+
+已验证输出：
+
+```text
+prefix z=(2,128,960)
+reference chunk=(2,50,32)
+actor action chunk=(1,10,7)
+All smoke tests passed.
+```
+
+短 Stage 2 mock 训练入口也已跑通：
+
+```bash
+/home/evoild/miniconda3/condabin/conda run -n LIBERO-smolvla \
+  python -m rlt.train_online \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --rl-token /tmp/rlt_random_ckpt/rl_token.pt \
+  --mock-env \
+  --total-env-steps 30 \
+  --warmup-env-steps 10 \
+  --batch-size 8 \
+  --num-inference-steps 2
+```
+
+## step 2-1: LIBERO 接入分析
+
+先不改 Algorithm 1 主体，先整理 `docs/rlt_libero_integration_analysis.md`，明确以下链路：
+
+```text
+LIBERO observation
+        ↓
+SmolVLA processor
+        ↓
+prefix hidden z_{1:M}
+        ↓
+RL Token Encoder
+        ↓
+z_rl
+        ↓
+Actor(z_rl, proprio, reference_action)
+        ↓
+RL action chunk
+        ↓
+LIBERO env.step
+        ↓
+reward / done / next_obs
+        ↓
+Replay Buffer
+        ↓
+Actor-Critic update
+```
+
+需要确认：
+
+- LeRobot 当前如何创建 LIBERO env。
+- observation 的 image/state/language key 和 tensor shape。
+- SmolVLA processor、normalizer、unnormalizer 的调用位置。
+- `predict_action_chunk()` / flow matching / prefix hidden 的调用链。
+- action normalization / unnormalization。
+- episode termination、truncation 和 LIBERO success 判定。
+- RLT `ChunkEnv`、`RLTController`、`train_online.py` 对 env 的具体要求。
+
+## step 2-2: 实现 `LiberoChunkEnv`
+
+新增 `smollvla_rltoken/rlt/libero_env.py`，实现现有 `ChunkEnv` 协议：
+
+```python
+reset()
+step(action_chunk)
+obs_to_batch(obs)
+get_intervention()
+```
+
+实现原则：
+
+- `obs_to_batch()` 必须复用当前 SmolVLA/LeRobot 的 processor 和 preprocessing 逻辑，禁止另写一套图像、state、language、normalization 处理。
+- actor 输出的是 chunk，但 LIBERO env 按单步 action 执行，因此 `step(action_chunk)` 内部逐 action 调用 `env.step(action)`。
+- 每次执行最多 `C=10` 步；遇到 terminated、truncated 或 success 立即提前结束。
+- 每执行完一个 RLT chunk 后重新读取 observation，重新计算 `z_rl`、reference chunk 和 actor action。
+
+## step 2-3: Frozen VLA + RLT inference smoke test
+
+新增：
+
+```text
+scripts/test_rlt_libero_rollout.py
+```
+
+先只跑 1 个 LIBERO task、3 个 episodes，不训练 Actor/Critic，只验证真实 LIBERO rollout 链路：
+
+```text
+LIBERO observation
+  -> frozen SmolVLA
+  -> prefix hidden
+  -> z_rl
+  -> reference action
+  -> actor action
+  -> LIBERO env.step
+```
+
+检查项：
+
+- prefix hidden shape
+- `z_rl` shape
+- reference action shape
+- actor action shape
+- action 是否包含 NaN / Inf
+- action range 是否合理
+- episode 是否能正常 terminate / truncate
+- success 是否能正确读取
+
+## step 2-4: Stage 1 RL Token reconstruction training
+
+使用当前项目一致的 checkpoint 和 dataset：
+
+```text
+checkpoint: /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero
+dataset: /home/evoild/program/smolVLA_mujoco_LIBERO/libero
+suite: libero_spatial
+```
+
+训练目标：
+
+```text
+SmolVLA frozen
+  -> prefix final hidden z_{1:M}
+  -> RL Token encoder
+  -> z_rl
+  -> decoder reconstruct sg(z)
+```
+
+第一阶段不联合 SFT VLA：
+
+```text
+vla_sft_alpha = 0
+```
+
+输出目录：
+
+```text
+outputs/rlt_libero/stage1/
+```
+
+记录指标：
+
+- train reconstruction loss
+- validation reconstruction loss
+- `z_rl` norm
+- gradient norm
+- training time
+- GPU memory
+
+## step 2-5: Stage 2 LIBERO Online RL
+
+冻结：
+
+```text
+SmolVLA
+RL Token encoder
+```
+
+只训练：
+
+```text
+Actor
+Twin Critic
+```
+
+沿用现有 RLT 的 TD3-style Twin Q、min-Q target、BC regularization、reference action、Replay Buffer 和 UTD update。第一阶段不加 human intervention。
+
+奖励先使用 LIBERO sparse reward：
+
+```text
+success = 1
+otherwise = 0
+```
+
+不加入未经验证的 dense reward。
+
+## step 2-6: 解决 cold-start
+
+不要让随机初始化 Actor 直接控制 LIBERO。优先实现 residual actor：
+
+```text
+actor_action = reference_action + delta_action
+```
+
+要求：
+
+- `delta_action` output layer zero initialization。
+- 初始时 `actor_action ≈ SmolVLA reference_action`。
+- 保留 BC regularization：`L_actor = -Q + beta * L_BC`。
+- 记录 `||delta_action||` 和 `||actor_action - reference_action||`。
+
+## step 2-7: 实验设计与评测
+
+先不跑全部 40 tasks。从 `docs/baseline/per_task.csv` 自动选择 LIBERO-Spatial 中 baseline 成功率约 40%-80% 的 1-3 个任务，避免 baseline 接近 0% 或 100%。
+
+至少建立三个 baseline：
+
+| 方案 | 目的 |
+| --- | --- |
+| Frozen SmolVLA | 原始模型基准 |
+| Frozen SmolVLA + untrained residual Actor | 验证 zero-init 后成功率应接近 SmolVLA |
+| SmolVLA + trained RLT Actor | RL 后训练结果 |
+
+训练记录：
+
+- episode return
+- episode success
+- success rate moving average
+- critic Q mean
+- critic loss
+- actor loss
+- BC loss
+- `||actor - reference||`
+- `||delta_action||`
+- replay buffer size
+- UTD updates
+
+评测时固定 Actor，不做 gradient update。最终至少运行 100 evaluation episodes，输出：
+
+```text
+baseline success rate
+RLT success rate
+absolute improvement percentage points
+```
+
+同时保留 successful / failed episode video，用于 failure analysis。
+
 # step 3: 量化部署
 ## step 3-1: baseline
 ### A. 模型结构和实验基准
