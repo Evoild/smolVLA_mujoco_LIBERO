@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-path", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", default="runs/deploy/3-1baseline/profile")
-    parser.add_argument("--task", default="libero_goal baseline forward profile")
+    parser.add_argument("--task", default="libero_spatial baseline forward profile")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
     return parser.parse_args()

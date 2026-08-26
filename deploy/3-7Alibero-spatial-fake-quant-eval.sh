@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$REPO_ROOT/scripts/common.sh"
+
+POLICY_PATH="$REPO_ROOT/smolvla_libero"
+TASK_SUITE=libero_spatial
+OUTPUT_ROOT="$REPO_ROOT/runs/deploy/3-7/A-libero-spatial-fake-quant-eval"
+SCALES_JSON=""
+DEVICE=cuda
+SEED=1000
+EPISODES=1
+EVAL_BATCH_SIZE=1
+MAX_PARALLEL_TASKS=1
+CALIBRATION_SAMPLES=32
+TOKEN_LENGTH=48
+PERCENTILE=99.99
+RUN_CALIBRATION=true
+PYTHON="${PYTHON_BIN:-python3}"
+GATE_UP_REGEX="^model\\.vlm_with_expert\\.vlm\\.model\\.text_model\\.layers\\.[0-9]+\\.mlp\\.(gate_proj|up_proj)$"
+DOWN_REGEX="^model\\.vlm_with_expert\\.vlm\\.model\\.text_model\\.layers\\.[0-9]+\\.mlp\\.down_proj$"
+
+usage() {
+  printf '%s\n' "Usage: $0 [options]" \
+    "  --policy-path PATH          default: $POLICY_PATH" \
+    "  --output-root DIR          default: $OUTPUT_ROOT" \
+    "  --scales-json PATH         default: OUTPUT_ROOT/gate_up_activation_channel_scales.json" \
+    "  --device DEVICE            default: $DEVICE" \
+    "  --seed N                   default: $SEED" \
+    "  --episodes N               default: $EPISODES" \
+    "  --eval-batch-size N        default: $EVAL_BATCH_SIZE" \
+    "  --max-parallel-tasks N     default: $MAX_PARALLEL_TASKS" \
+    "  --calibration-samples N    default: $CALIBRATION_SAMPLES" \
+    "  --token-length N           default: $TOKEN_LENGTH" \
+    "  --percentile P             default: $PERCENTILE" \
+    "  --run-calibration true|false default: $RUN_CALIBRATION" \
+    "  PYTHON_BIN=/path/python    optional Python with torch/lerobot dependencies"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --policy-path) require_value "$@"; POLICY_PATH="$2"; shift 2 ;;
+    --output-root) require_value "$@"; OUTPUT_ROOT="$2"; shift 2 ;;
+    --scales-json) require_value "$@"; SCALES_JSON="$2"; shift 2 ;;
+    --device) require_value "$@"; DEVICE="$2"; shift 2 ;;
+    --seed) require_value "$@"; SEED="$2"; shift 2 ;;
+    --episodes) require_value "$@"; EPISODES="$2"; shift 2 ;;
+    --eval-batch-size) require_value "$@"; EVAL_BATCH_SIZE="$2"; shift 2 ;;
+    --max-parallel-tasks) require_value "$@"; MAX_PARALLEL_TASKS="$2"; shift 2 ;;
+    --calibration-samples) require_value "$@"; CALIBRATION_SAMPLES="$2"; shift 2 ;;
+    --token-length) require_value "$@"; TOKEN_LENGTH="$2"; shift 2 ;;
+    --percentile) require_value "$@"; PERCENTILE="$2"; shift 2 ;;
+    --run-calibration) require_value "$@"; RUN_CALIBRATION="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+case "$RUN_CALIBRATION" in true|false) ;; *) die "--run-calibration must be true or false" ;; esac
+
+EVAL_DIR="$OUTPUT_ROOT/eval"
+REPORT_DIR="$OUTPUT_ROOT/report"
+mkdir -p "$OUTPUT_ROOT"
+SCALES_JSON="${SCALES_JSON:-$OUTPUT_ROOT/gate_up_activation_channel_scales.json}"
+
+export LEROBOT_SRC="${LEROBOT_SRC:-$REPO_ROOT/lerobot/src}"
+export PYTHONPATH="$SCRIPT_DIR:$LEROBOT_SRC${PYTHONPATH:+:$PYTHONPATH}"
+
+if [[ "$RUN_CALIBRATION" == "true" ]]; then
+  "$PYTHON" "$SCRIPT_DIR/calibrate_smolvla_activation_channel_scales.py" \
+    --policy-path "$POLICY_PATH" \
+    --output "$SCALES_JSON" \
+    --device "$DEVICE" \
+    --tasks "$TASK_SUITE" \
+    --seed "$SEED" \
+    --samples "$CALIBRATION_SAMPLES" \
+    --percentile "$PERCENTILE" \
+    --batch-size "$EVAL_BATCH_SIZE" \
+    --token-length "$TOKEN_LENGTH" \
+    --include-module-regex "$GATE_UP_REGEX"
+else
+  [[ -f "$SCALES_JSON" ]] || die "$SCALES_JSON not found; enable --run-calibration true or pass --scales-json"
+fi
+
+"$PYTHON" "$SCRIPT_DIR/linear_only_quant.py" eval \
+  --policy-path "$POLICY_PATH" \
+  --device "$DEVICE" \
+  --output-dir "$EVAL_DIR" \
+  --tasks "$TASK_SUITE" \
+  --seed "$SEED" \
+  --episodes "$EPISODES" \
+  --batch-size "$EVAL_BATCH_SIZE" \
+  --max-parallel-tasks "$MAX_PARALLEL_TASKS" \
+  --quantize-module-regex "$GATE_UP_REGEX" \
+  --fake-quant-kind w8a8 \
+  --fake-quant-activation-scale-mode calibrated \
+  --fake-quant-activation-scales-json "$SCALES_JSON" \
+  --extra-w8a16-module-regex "$DOWN_REGEX"
+
+"$PYTHON" "$REPO_ROOT/scripts/analyze_eval.py" \
+  "$EVAL_DIR/eval_info.json" \
+  --plot-suite "$TASK_SUITE" \
+  --output-dir "$REPORT_DIR"
+
+printf '%s\n' "step 3-7A libero_spatial fake quant eval outputs:" \
+  "  eval: $EVAL_DIR" \
+  "  report: $REPORT_DIR" \
+  "  gate/up per-channel activation scales: $SCALES_JSON"

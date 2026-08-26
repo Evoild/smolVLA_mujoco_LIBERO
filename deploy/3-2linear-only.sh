@@ -7,13 +7,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$REPO_ROOT/scripts/common.sh"
 
 POLICY_PATH="$REPO_ROOT/smolvla_libero"
-TASK_SUITE=libero_spatial
+TASK_SUITE=libero_goal
 SEED=1000
 EPISODES=10
 EVAL_BATCH_SIZE=1
 MAX_PARALLEL_TASKS=1
 DEVICE=cuda
-OUTPUT_ROOT="$REPO_ROOT/runs/deploy/3-1baseline"
+OUTPUT_ROOT="$REPO_ROOT/runs/deploy/3-2linear-only"
 EVAL_DIR=""
 REPORT_DIR=""
 PROFILE_DIR=""
@@ -26,7 +26,6 @@ PYTHON="${PYTHON_BIN:-python3}"
 usage() {
   printf '%s\n' "Usage: $0 [options]" \
     "  --policy-path PATH          default: $POLICY_PATH" \
-    "  --tasks NAME                default: $TASK_SUITE" \
     "  --device DEVICE            default: $DEVICE" \
     "  --seed N                   default: $SEED" \
     "  --episodes N               default: $EPISODES" \
@@ -46,7 +45,6 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --policy-path) require_value "$@"; POLICY_PATH="$2"; shift 2 ;;
-    --tasks) require_value "$@"; TASK_SUITE="$2"; shift 2 ;;
     --device) require_value "$@"; DEVICE="$2"; shift 2 ;;
     --seed) require_value "$@"; SEED="$2"; shift 2 ;;
     --episodes) require_value "$@"; EPISODES="$2"; shift 2 ;;
@@ -85,16 +83,19 @@ if [[ "$RUN_PROFILE" == "true" && -e "$PROFILE_DIR" ]]; then
   die "$PROFILE_DIR already exists; pass a new --profile-dir or --output-root"
 fi
 
+export LEROBOT_SRC="${LEROBOT_SRC:-$REPO_ROOT/lerobot/src}"
+export PYTHONPATH="$LEROBOT_SRC${PYTHONPATH:+:$PYTHONPATH}"
+
 if [[ "$RUN_EVAL" == "true" ]]; then
-  bash "$REPO_ROOT/scripts/eval_libero.sh" \
+  "$PYTHON" "$SCRIPT_DIR/linear_only_quant.py" eval \
     --policy-path "$POLICY_PATH" \
+    --device "$DEVICE" \
+    --output-dir "$EVAL_DIR" \
     --tasks "$TASK_SUITE" \
-    --seeds "$SEED" \
+    --seed "$SEED" \
     --episodes "$EPISODES" \
     --batch-size "$EVAL_BATCH_SIZE" \
-    --max-parallel-tasks "$MAX_PARALLEL_TASKS" \
-    --device "$DEVICE" \
-    --output-dir "$EVAL_DIR"
+    --max-parallel-tasks "$MAX_PARALLEL_TASKS"
 
   "$PYTHON" "$REPO_ROOT/scripts/analyze_eval.py" \
     "$EVAL_DIR/eval_info.json" \
@@ -103,18 +104,16 @@ if [[ "$RUN_EVAL" == "true" ]]; then
 fi
 
 if [[ "$RUN_PROFILE" == "true" ]]; then
-  LEROBOT_SRC="${LEROBOT_SRC:-$REPO_ROOT/lerobot/src}" \
-  PYTHONPATH="${LEROBOT_SRC:-$REPO_ROOT/lerobot/src}${PYTHONPATH:+:$PYTHONPATH}" \
-  "$PYTHON" "$SCRIPT_DIR/profile_3_1_baseline.py" \
+  "$PYTHON" "$SCRIPT_DIR/linear_only_quant.py" profile \
     --policy-path "$POLICY_PATH" \
     --device "$DEVICE" \
     --output-dir "$PROFILE_DIR" \
     --warmup "$PROFILE_WARMUP" \
     --iters "$PROFILE_ITERS" \
-    --task "$TASK_SUITE baseline forward profile"
+    --task "libero_goal linear-only W8A8 profile"
 fi
 
-printf '%s\n' "step 3-1 baseline outputs:" \
+printf '%s\n' "step 3-2 linear-only outputs:" \
   "  success eval: $EVAL_DIR" \
   "  success report: $REPORT_DIR" \
   "  forward profile: $PROFILE_DIR"
