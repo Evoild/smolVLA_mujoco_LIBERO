@@ -26,6 +26,7 @@ from lerobot.utils.constants import OBS_STATE
 from .actor_critic import RLTAgent
 from .configs import ActorCriticConfig, OnlineRLConfig, RLTokenConfig
 from .envs import MockManipEnv
+from .libero_env import LiberoChunkEnv
 from .replay_buffer import ChunkRecord, ChunkReplayBuffer
 from .rl_token import RLTokenModule
 from .rlt_policy import RLTController
@@ -82,13 +83,16 @@ class RolloutWorker:
 
         rewards = torch.zeros(c)
         inter_obs: list[dict] = []
-        success, truncated, done_step = False, False, None
+        success, env_done, truncated, done_step = False, False, False, None
         for j in range(c):
-            self.obs, r, success = self.env.step(actions[j])
+            self.obs, r, step_done = self.env.step(actions[j])
+            step_success = bool(getattr(self.env, "last_success", step_done))
             rewards[j] = r
             self.ep_steps += 1
             self.ep_return += r
-            if success:
+            if step_done:
+                env_done = True
+                success = step_success
                 done_step = j + 1
                 break
             if self.ep_steps >= self.env.max_episode_steps:
@@ -108,15 +112,15 @@ class RolloutWorker:
             actions=actions.detach().cpu(),
             rewards=rewards,
             ref_full=ref_full.detach().cpu(),
-            done=success,
+            done=env_done,
             done_step=done_step,
         )
         self.buffer.add_chunk(rec)
-        if truncated and not success:
+        if (truncated or env_done) and not success:
             self.buffer.end_episode()
 
         n_steps = done_step if done_step is not None else c
-        return n_steps, success or truncated, success
+        return n_steps, env_done or truncated, success
 
 
 def train(args):
@@ -160,18 +164,30 @@ def train(args):
         num_inference_steps=args.num_inference_steps,
     )
 
-    if not args.mock_env:
-        raise NotImplementedError(
-            "Only --mock-env is wired up in this repo; implement ChunkEnv for a "
-            "real robot or simulator and pass it here."
+    if args.libero_env:
+        env = LiberoChunkEnv(
+            policy=policy,
+            checkpoint=args.checkpoint,
+            suite_name=args.libero_suite,
+            task_id=args.libero_task_id,
+            max_episode_steps=cfg.max_episode_steps,
+            seed=cfg.seed,
+            device=device,
+            init_states=not args.libero_no_init_states,
+            control_mode=args.libero_control_mode,
+            observation_height=args.libero_observation_height,
+            observation_width=args.libero_observation_width,
         )
-    env = MockManipEnv(
-        action_dim=cfg.ac.action_dim,
-        state_dim=state_dim,
-        camera_keys=tuple(policy.config.image_features),
-        max_episode_steps=cfg.max_episode_steps,
-        seed=cfg.seed,
-    )
+    elif args.mock_env:
+        env = MockManipEnv(
+            action_dim=cfg.ac.action_dim,
+            state_dim=state_dim,
+            camera_keys=tuple(policy.config.image_features),
+            max_episode_steps=cfg.max_episode_steps,
+            seed=cfg.seed,
+        )
+    else:
+        raise ValueError("Select one environment backend: --mock-env or --libero-env")
 
     x_dim = cfg.ac.rl_token_dim + cfg.ac.proprio_dim
     buffer = ChunkReplayBuffer(
@@ -225,6 +241,8 @@ def train(args):
 
     torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
     print(f"[stage2] done; {episodes} episodes, saved to {out_dir/'rlt_agent.pt'}")
+    if hasattr(env, "close"):
+        env.close()
 
 
 def main():
@@ -235,6 +253,13 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default=None, choices=[None, "float32", "bfloat16"])
     p.add_argument("--mock-env", action="store_true")
+    p.add_argument("--libero-env", action="store_true")
+    p.add_argument("--libero-suite", default="libero_spatial")
+    p.add_argument("--libero-task-id", type=int, default=0)
+    p.add_argument("--libero-control-mode", default="relative", choices=["relative", "absolute"])
+    p.add_argument("--libero-no-init-states", action="store_true")
+    p.add_argument("--libero-observation-height", type=int, default=360)
+    p.add_argument("--libero-observation-width", type=int, default=360)
     p.add_argument("--chunk-len", type=int, default=10)
     p.add_argument("--action-dim", type=int, default=None)
     p.add_argument("--proprio-dim", type=int, default=None)
