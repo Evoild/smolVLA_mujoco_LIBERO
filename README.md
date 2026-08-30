@@ -221,6 +221,8 @@ Actor-Critic update
 
 ## step 2-2: 实现 `LiberoChunkEnv`
 
+状态：已完成。
+
 新增 `smollvla_rltoken/rlt/libero_env.py`，实现现有 `ChunkEnv` 协议：
 
 ```python
@@ -237,7 +239,61 @@ get_intervention()
 - 每次执行最多 `C=10` 步；遇到 terminated、truncated 或 success 立即提前结束。
 - 每执行完一个 RLT chunk 后重新读取 observation，重新计算 `z_rl`、reference chunk 和 actor action。
 
+实际实现中保持现有 `RolloutWorker` 协议：`LiberoChunkEnv.step(action)` 只执行单个 normalized action，chunk 循环仍由 `RolloutWorker` 负责，避免 env 内部和 worker 双重循环。
+
+新增内容：
+
+- `smollvla_rltoken/rlt/libero_env.py`
+  - 直接包装 LeRobot `LiberoEnv` / LIBERO `OffScreenRenderEnv`。
+  - `obs_to_batch()` 复用 `preprocess_observation`、`LiberoProcessorStep` 和 checkpoint 内 SmolVLA preprocessor。
+  - `step()` 在执行前复用 checkpoint postprocessor，把 RLT normalized action unnormalize 到 LIBERO env action。
+  - sparse reward：`reward = 1.0 if info["is_success"] else 0.0`。
+- `smollvla_rltoken/rlt/train_online.py`
+  - 新增 `--libero-env`、`--libero-suite`、`--libero-task-id` 等参数。
+  - 保留 `--mock-env` 原路径。
+  - `RolloutWorker` 兼容 env 的 `last_success`，区分 episode done 和真实 LIBERO success。
+
+已验证 `LiberoChunkEnv` 可以完成：
+
+```text
+reset
+  -> obs_to_batch
+  -> SmolVLA/RLT batch keys
+  -> postprocess normalized action
+  -> LIBERO env.step
+```
+
+验证命令：
+
+```bash
+cd /home/evoild/program/smolVLA_mujoco_LIBERO/smollvla_rltoken
+
+/home/evoild/miniconda3/condabin/conda run -n LIBERO-smolvla \
+  python -m rlt.train_online \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --rl-token /tmp/rlt_random_ckpt/rl_token.pt \
+  --libero-env \
+  --libero-suite libero_spatial \
+  --libero-task-id 0 \
+  --total-env-steps 2 \
+  --warmup-env-steps 2 \
+  --batch-size 8 \
+  --num-inference-steps 2 \
+  --max-episode-steps 5 \
+  --log-freq 1 \
+  --out /tmp/rlt_libero_env_smoke
+```
+
+短 rollout 已跑通，输出示例：
+
+```text
+[stage2] steps=5 eps=1 buffer=3 success20=0.00
+[stage2] done; 1 episodes, saved to /tmp/rlt_libero_env_smoke/rlt_agent.pt
+```
+
 ## step 2-3: Frozen VLA + RLT inference smoke test
+
+状态：已完成。
 
 新增：
 
@@ -268,14 +324,42 @@ LIBERO observation
 - episode 是否能正常 terminate / truncate
 - success 是否能正确读取
 
+实现位置：
+
+```text
+smollvla_rltoken/scripts/test_rlt_libero_rollout.py
+```
+
+该脚本只做 inference 和 env rollout，不做任何 Actor/Critic/RL-token 梯度更新。若未传入 `--rl-token`，脚本会创建随机初始化的 `RLTokenModule`，用于验证真实 LIBERO 接口和 RLT 前向 plumbing；Stage 1 完成后应传入训练好的 `rl_token.pt`。
+
+验证命令：
+
+```bash
+cd /home/evoild/program/smolVLA_mujoco_LIBERO/smollvla_rltoken
+
+/home/evoild/miniconda3/condabin/conda run -n LIBERO-smolvla \
+  python scripts/test_rlt_libero_rollout.py \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --device cuda \
+  --suite libero_spatial \
+  --task-id 0 \
+  --episodes 3 \
+  --max-episode-steps 5 \
+  --num-inference-steps 2 \
+  --execute actor
+```
+
+
 ## step 2-4: Stage 1 RL Token reconstruction training
+
 
 使用当前项目一致的 checkpoint 和 dataset：
 
 ```text
 checkpoint: /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero
 dataset: /home/evoild/program/smolVLA_mujoco_LIBERO/libero
-suite: libero_spatial
+suite: libero_goal
+dataset task_index: 10-19
 ```
 
 训练目标：
@@ -297,7 +381,7 @@ vla_sft_alpha = 0
 输出目录：
 
 ```text
-outputs/rlt_libero/stage1/
+outputs/rlt_libero/stage1_goal_fixed/
 ```
 
 记录指标：
@@ -309,7 +393,114 @@ outputs/rlt_libero/stage1/
 - training time
 - GPU memory
 
+实现位置：
+
+```text
+smollvla_rltoken/rlt/train_rl_token.py
+```
+
+当前 targeted repair 实验的 Stage 1 训练范围：
+
+```text
+train suite: libero_goal
+dataset task_index: 10-19
+target repair suite task_id for Stage 2: 3, 9
+guardrail suite task_id: 0, 1, 2, 4, 5, 6, 7, 8
+```
+
+说明：Stage 1 是 RL Token reconstruction pretraining，不直接优化 success。为了后续证明
+suite task 3/9 的成功率提升且其它 task 不掉点，这一步应覆盖 `libero_goal` 全 10 个 task；
+只在 Stage 2 online RL 中把 3/9 作为重点采样和奖励优化对象。Stage 2 评估必须同时报告
+3/9 与其它 8 个 guardrail tasks 的 per-task success rate。
+
+
+
+正式训练命令：
+
+```bash
+cd /home/evoild/program/smolVLA_mujoco_LIBERO/smollvla_rltoken
+
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_CACHE=/tmp/hf_datasets_cache \
+  python -m rlt.train_rl_token \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --dataset HuggingFaceVLA/libero \
+  --dataset-root /home/evoild/program/smolVLA_mujoco_LIBERO/libero \
+  --dataset-suite libero_goal \
+  --device cuda \
+  --steps 5000 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --vla-sft-alpha 0.0 \
+  --val-ratio 0.1 \
+  --val-freq 100 \
+  --val-batches 4 \
+  --log-freq 20 \
+  --save-freq 500 \
+  --out /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed
+```
+
+正式训练完成后检查：
+
+```bash
+cat /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/summary.json
+tail -n 5 /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/metrics.jsonl
+```
+
+修正后正式训练已完成：
+
+```text
+output: /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed
+steps: 5000
+dataset_suite: libero_goal
+dataset_task_indices: [10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+train_episodes: 385
+val_episodes: 43
+elapsed_s: 1229.78
+gpu_peak_mem_mb: 1761.92
+```
+
+最终指标：
+
+```text
+loss_ro: 1.44327 -> 0.07426
+last10 loss_ro mean: 0.08235
+val_loss_ro: 1.16488 -> 0.06356
+grad_norm final: 0.16808
+z_rl_norm final: 22.66667
+throughput final: 4.07 it/s
+```
+
+输出文件：
+
+```text
+rl_token.pt        57.4 MB
+metrics.jsonl      251 log rows
+summary.json
+tensorboard/events.out.tfevents.1787805679.evoild-ubuntu.45377.0
+loss_curve_train_val.png
+```
+
+Stage 1 train/val reconstruction loss 曲线：
+
+![Stage 1 RL Token reconstruction loss](outputs/rlt_libero/stage1_goal_fixed/loss_curve_train_val.png)
+
+
+曲线结论：
+
+```text
+train points: 251
+val points: 51
+loss_ro: 1.443269 -> 0.074257
+val_loss_ro: 1.164880 -> 0.063564
+```
+
+训练和验证 loss 同步下降，最终 `val_loss_ro` 没有高于 `loss_ro`，当前没有明显 reconstruction
+过拟合迹象。该图只能证明 Stage 1 表征重构训练收敛；是否提升 LIBERO success 仍需看 Stage 2
+online RL 和 Step 2-7 fixed-policy eval。
+
 ## step 2-5: Stage 2 LIBERO Online RL
+
+状态：入口已完成，`libero_goal` task 3/9 residual actor 短 smoke 已通过。
 
 冻结：
 
@@ -336,7 +527,102 @@ otherwise = 0
 
 不加入未经验证的 dense reward。
 
+实现位置：
+
+```text
+smollvla_rltoken/rlt/train_online.py
+```
+
+已补齐：
+
+- `--libero-task-ids 3,9`：在 episode 边界循环多个 LIBERO task，用同一个 Actor/Critic 做 targeted repair。
+- `metrics.jsonl`：记录 episode return/success/task_id、buffer size、critic/actor 更新指标、`delta_l2` 和 `actor_ref_l2`。
+- `summary.json`：记录 suite、task ids、env steps、episodes、success rate、Stage 1 RL Token checkpoint。
+- `rlt_agent.pt`：保存 Actor/Critic/target/optimizer 状态。
+
+使用 Stage 1 产物：
+
+```text
+/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/rl_token.pt
+```
+
+GPU 正式训练命令模板：
+
+```bash
+cd /home/evoild/program/smolVLA_mujoco_LIBERO/smollvla_rltoken
+
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_CACHE=/tmp/hf_datasets_cache \
+MPLCONFIGDIR=/tmp/matplotlib NUMBA_DISABLE_JIT=1 \
+/home/evoild/miniconda3/condabin/conda run --no-capture-output -n LIBERO-smolvla \
+  python -m rlt.train_online \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --rl-token /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/rl_token.pt \
+  --libero-env \
+  --libero-suite libero_goal \
+  --libero-task-ids 3,9 \
+  --device cuda \
+  --total-env-steps 20000 \
+  --warmup-env-steps 2000 \
+  --batch-size 256 \
+  --utd 5 \
+  --chunk-len 10 \
+  --num-inference-steps 2 \
+  --max-episode-steps 400 \
+  --log-freq 200 \
+  --save-freq 2000 \
+  --out /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage2_goal_3_9_fixed
+```
+
+
+训练期 episode success：
+
+```text
+all episodes:
+  task 3: 33/43 = 76.7%
+  task 9: 24/43 = 55.8%
+  total: 57/86 = 66.3%
+
+post-warmup episodes:
+  task 3: 29/39 = 74.4%
+  task 9: 24/40 = 60.0%
+  total: 53/79 = 67.1%
+
+last 20 episodes:
+  task 3: 8/10 = 80.0%
+  task 9: 5/10 = 50.0%
+  total: 13/20 = 65.0%
+```
+
+最后阶段训练指标：
+
+```text
+critic_loss last10 mean: 0.000127
+q_mean last10 mean: 0.12481
+target_mean last10 mean: 0.12499
+actor_loss last logged: -0.14162
+bc_dist last logged: 0.01323
+delta_l2 last logged: 0.16968
+actor_ref_l2 last logged: 0.23637
+throughput final: 31.47 steps/s
+```
+
+输出文件：
+
+```text
+rlt_agent.pt
+metrics.jsonl
+summary.json
+```
+
+结论：fixed Stage 2 已使用正确的 fixed Stage 1 RL Token。训练期 task 3 明显高于
+Frozen SmolVLA baseline 的 `30%`；task 9 训练期约 `56-60%`，接近/略低于本轮
+Frozen baseline eval 的 `60%`。这只是在线训练期间的统计，不能替代 guardrail eval；
+下一步必须用 Step 2-7 固定 Actor 重新评估 `libero_goal` 0-9，确认 task 3/9 提升是否
+导致其它 task 掉点。
+
 ## step 2-6: 解决 cold-start
+
+状态：已完成。Actor 已改为 zero-init residual actor。
 
 不要让随机初始化 Actor 直接控制 LIBERO。优先实现 residual actor：
 
@@ -351,9 +637,54 @@ actor_action = reference_action + delta_action
 - 保留 BC regularization：`L_actor = -Q + beta * L_BC`。
 - 记录 `||delta_action||` 和 `||actor_action - reference_action||`。
 
+实现位置：
+
+```text
+smollvla_rltoken/rlt/actor_critic.py
+smollvla_rltoken/rlt/rlt_policy.py
+smollvla_rltoken/rlt/train_online.py
+```
+
+实现细节：
+
+- `ChunkActor` 预测 `delta_action`，动作均值为 `ref_chunk + delta_action`。
+- Actor 最后一层 `Linear` 的 weight/bias zero initialization。
+- reference dropout 只作用于 `delta_action` 网络输入，不作用于 residual skip。
+- deterministic 初始 actor 满足 `actor.mu(x, ref) == ref`。
+- rollout 和 update 日志记录 `rollout_delta_l2`、`rollout_actor_ref_l2`、`delta_l2`、`actor_ref_l2`。
+
+已验证：
+
+```text
+max_mu_ref_abs 0.0
+max_delta_abs 0.0
+```
+
+Stage 2 residual smoke 输出中，warmup chunk 的 rollout residual 距离为 0：
+
+```text
+"rollout_actor_ref_l2": 0.0
+"rollout_delta_l2": 0.0
+```
+ 
 ## step 2-7: 实验设计与评测
 
-先不跑全部 40 tasks。从 `docs/baseline/per_task.csv` 自动选择 LIBERO-Spatial 中 baseline 成功率约 40%-80% 的 1-3 个任务，避免 baseline 接近 0% 或 100%。
+状态：guardrail eval 脚本已完成，短 smoke 已通过。
+
+当前目标不是再训练，而是验证 task 3/9 的提升是否以其它 `libero_goal` task 掉点为代价。
+评估范围固定为 `libero_goal` 的 suite task id `0-9`：
+
+```text
+target tasks: 3, 9
+guardrail tasks: 0, 1, 2, 4, 5, 6, 7, 8
+```
+
+LIBERO env 中这两个 target task 的真实描述是：
+
+```text
+task 3: open the top drawer and put the bowl inside
+task 9: put the wine bottle on the rack
+```
 
 至少建立三个 baseline：
 
@@ -386,6 +717,245 @@ absolute improvement percentage points
 ```
 
 同时保留 successful / failed episode video，用于 failure analysis。
+
+实现位置：
+
+```text
+smollvla_rltoken/scripts/eval_rlt_libero_guardrail.py
+```
+
+输出文件：
+
+```text
+episodes.csv
+per_task.csv
+summary.json
+videos/  # 仅加 --save-videos 时生成
+```
+
+Frozen SmolVLA baseline 评估：
+
+```bash
+cd /home/evoild/program/smolVLA_mujoco_LIBERO/smollvla_rltoken
+
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_CACHE=/tmp/hf_datasets_cache \
+MPLCONFIGDIR=/tmp/matplotlib NUMBA_DISABLE_JIT=1 \
+/home/evoild/miniconda3/condabin/conda run --no-capture-output -n LIBERO-smolvla \
+  python scripts/eval_rlt_libero_guardrail.py \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --rl-token /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/rl_token.pt \
+  --suite libero_goal \
+  --task-ids 0,1,2,3,4,5,6,7,8,9 \
+  --episodes-per-task 100 \
+  --max-episode-steps 400 \
+  --chunk-len 10 \
+  --num-inference-steps 2 \
+  --device cuda \
+  --out /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_baseline
+```
+
+RLT actor 评估：
+
+```bash
+cd /home/evoild/program/smolVLA_mujoco_LIBERO/smollvla_rltoken
+
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_CACHE=/tmp/hf_datasets_cache \
+MPLCONFIGDIR=/tmp/matplotlib NUMBA_DISABLE_JIT=1 \
+/home/evoild/miniconda3/condabin/conda run --no-capture-output -n LIBERO-smolvla \
+  python scripts/eval_rlt_libero_guardrail.py \
+  --checkpoint /home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero \
+  --rl-token /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/rl_token.pt \
+  --agent /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage2_goal_3_9_fixed/rlt_agent.pt \
+  --suite libero_goal \
+  --task-ids 0,1,2,3,4,5,6,7,8,9 \
+  --episodes-per-task 100 \
+  --max-episode-steps 400 \
+  --chunk-len 10 \
+  --num-inference-steps 2 \
+  --device cuda \
+  --out /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_rlt
+```
+
+加 `--save-videos` 可以保存每个 episode 的 mp4，但会显著增加磁盘和耗时。正式 failure
+analysis 时建议只对 task 3/9 或失败 episode 复跑加视频。
+
+正式 100 episodes/task 评估结果：
+
+```text
+baseline: /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_baseline
+RLT:      /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_rlt
+```
+
+整体结果：
+
+| Split | Baseline | RLT | Delta |
+| --- | ---: | ---: | ---: |
+| target task 3/9 mean | 48.0% | 34.0% | -14.0 pp |
+| guardrail task mean | 87.0% | 86.9% | -0.1 pp |
+| all libero_goal | 79.2% | 76.3% | -2.9 pp |
+
+per-task 结果：
+
+| task_id | Task | Baseline | RLT | Delta |
+| ---: | --- | ---: | ---: | ---: |
+| 0 | open the middle drawer of the cabinet | 72.0% | 80.0% | +8.0 pp |
+| 1 | put the bowl on the stove | 97.0% | 95.0% | -2.0 pp |
+| 2 | put the wine bottle on top of the cabinet | 87.0% | 85.0% | -2.0 pp |
+| 3 | open the top drawer and put the bowl inside | 45.0% | 37.0% | -8.0 pp |
+| 4 | put the bowl on top of the cabinet | 96.0% | 93.0% | -3.0 pp |
+| 5 | push the plate to the front of the stove | 87.0% | 84.0% | -3.0 pp |
+| 6 | put the cream cheese in the bowl | 82.0% | 86.0% | +4.0 pp |
+| 7 | turn on the stove | 96.0% | 97.0% | +1.0 pp |
+| 8 | put the bowl on the plate | 79.0% | 75.0% | -4.0 pp |
+| 9 | put the wine bottle on the rack | 51.0% | 31.0% | -20.0 pp |
+
+结论：这次 RLT 后训练没有证明 targeted repair。好的一点是 guardrail tasks 基本没有整体掉点
+（-0.1 pp），说明对其它 `libero_goal` task 的负迁移很小；但目标 task 3/9 平均下降
+14.0 pp，尤其 task 9 明显退化。因此当前 checkpoint 不应作为成功结果，只能作为
+negative result。下一轮应降低 Actor 偏离 reference 的幅度，例如提高 `bc_beta`、降低
+`action_std`、缩短训练步数，或把 task 3/9 与 guardrail tasks 混合训练后再评估。
+
+fixed Stage 2 guardrail eval 已完成：
+
+```text
+baseline output: /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_baseline
+RLT output: /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_rlt
+episodes: 200 each
+episodes_per_task: 20
+```
+
+补充：`eval_goal_baseline` 后续被 100 episodes/task 的 frozen reference 复跑覆盖。当前该目录
+中的 baseline summary 为：
+
+```text
+output: /home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_baseline
+mode: frozen_reference
+episodes: 1000
+episodes_per_task: 100
+successes: 792
+success_rate: 79.2%
+elapsed_s: 3007.32
+```
+
+100 episodes/task baseline per-task：
+
+| task | task description | Frozen success |
+| ---: | --- | ---: |
+| 0 | open the middle drawer of the cabinet | 72/100 = 72% |
+| 1 | put the bowl on the stove | 97/100 = 97% |
+| 2 | put the wine bottle on top of the cabinet | 87/100 = 87% |
+| 3 | open the top drawer and put the bowl inside | 45/100 = 45% |
+| 4 | put the bowl on top of the cabinet | 96/100 = 96% |
+| 5 | push the plate to the front of the stove | 87/100 = 87% |
+| 6 | put the cream cheese in the bowl | 82/100 = 82% |
+| 7 | turn on the stove | 96/100 = 96% |
+| 8 | put the bowl on the plate | 79/100 = 79% |
+| 9 | put the wine bottle on the rack | 51/100 = 51% |
+
+100 episodes/task baseline 分组：
+
+```text
+target tasks 3/9:
+  Frozen: 96/200 = 48.0%
+
+guardrail tasks 0/1/2/4/5/6/7/8:
+  Frozen: 696/800 = 87.0%
+
+overall:
+  Frozen: 792/1000 = 79.2%
+```
+
+这次更长 baseline 与 20 episodes/task baseline 的 `79.5%` 很接近，说明在当前
+guardrail 脚本口径下 frozen reference 大约稳定在 `79-80%`。但它仍然不是 Step 1
+`lerobot-eval` 口径的 `66%`，主要结果报告前仍需统一评测入口。当前 RLT 输出目录是
+50 episodes/task，不能和这个 100 episodes/task baseline 直接做最终 A/B 结论。
+
+注意：下面结果是 `scripts/eval_rlt_libero_guardrail.py` 的固定 Actor 评测口径，不是 Step 1
+的 `lerobot-eval` 原始口径。Step 1 中 `LIBERO-Goal` 的 frozen SmolVLA baseline 是
+`66/100 = 66%`；这里 guardrail 脚本重新评估 frozen reference 得到 `159/200 = 79.5%`，
+说明两套评测链路存在口径差异，不能直接把这里的 79.5% 当作 Step 1 baseline。Step 2-7
+当前只能用于同一脚本内的 A/B 对比，也就是比较同一 `LiberoChunkEnv + RLTController`
+链路下的 frozen reference 与 RLT actor。
+
+口径对照：
+
+| evaluation path | policy mode | successes | episodes | success rate | note |
+| --- | --- | ---: | ---: | ---: | --- |
+| Step 1 `lerobot-eval` | SmolVLA baseline | 66 | 100 | 66.0% | README Step 1 / `docs/baseline` |
+| Step 2-7 guardrail script | frozen reference | 159 | 200 | 79.5% | RLT eval wrapper, seed/defaults differ |
+| Step 2-7 guardrail script | RLT actor | 161 | 200 | 80.5% | same wrapper as frozen reference |
+
+Step 2-7 同脚本 A/B 结果：
+
+```text
+Frozen SmolVLA: 159/200 = 79.5%
+RLT actor:      161/200 = 80.5%
+delta:          +1.0 percentage point
+```
+
+per-task 结果：
+
+| task | task description | Frozen | RLT | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 0 | open the middle drawer of the cabinet | 75% | 95% | +20 |
+| 1 | put the bowl on the stove | 100% | 95% | -5 |
+| 2 | put the wine bottle on top of the cabinet | 80% | 95% | +15 |
+| 3 | open the top drawer and put the bowl inside | 55% | 40% | -15 |
+| 4 | put the bowl on top of the cabinet | 95% | 100% | +5 |
+| 5 | push the plate to the front of the stove | 95% | 80% | -15 |
+| 6 | put the cream cheese in the bowl | 90% | 95% | +5 |
+| 7 | turn on the stove | 95% | 100% | +5 |
+| 8 | put the bowl on the plate | 65% | 55% | -10 |
+| 9 | put the wine bottle on the rack | 45% | 50% | +5 |
+
+分组结果：
+
+```text
+target tasks 3/9:
+  Frozen: 20/40 = 50.0%
+  RLT:    18/40 = 45.0%
+  delta:  -5.0 points
+
+guardrail tasks 0/1/2/4/5/6/7/8:
+  Frozen: 139/160 = 86.9%
+  RLT:    143/160 = 89.4%
+  delta:   +2.5 points
+```
+
+结论：20 episodes/task 后，当前 fixed Stage 2 配置的 overall 从 `79.5%` 到 `80.5%`，guardrail
+从 `86.9%` 到 `89.4%`，没有出现整体掉点；但 targeted repair 仍未成立。目标 task 3/9 平均从
+`50.0%` 降到 `45.0%`，其中 task 3 从 `55%` 降到 `40%`，task 9 只从 `45%` 到 `50%`。
+因此这轮结果最多说明 RLT actor 在该 guardrail 脚本口径下没有明显损伤整体成功率，但不能证明
+“RL 后训练修复 task 3/9 特定失败”。
+
+同时，由于 Step 2-7 frozen reference 的 `79.5%` 与 Step 1 `lerobot-eval` 的 `66%` 不一致，后续
+若要写论文/报告中的主结果，必须先统一评测入口。推荐增加一个 `lerobot-eval` 兼容的 RLT
+policy wrapper，或让 guardrail 脚本严格复刻 Step 1 的 seed、episode sampling、action selection
+和 environment 参数后再报告最终数字。
+
+诊断：
+
+```text
+task 9 actor_ref_l2_mean: 0.1704
+task 3 actor_ref_l2_mean: 0.1595
+task 4 actor_ref_l2_mean: 0.2316
+```
+
+Actor 已经明显偏离 reference，但这种偏移没有带来 eval success 提升。下一轮不应继续扩大训练步数，
+应先加强保守约束：
+
+```text
+bc_beta: 1.0 -> 2.0 或 5.0
+action_std: 0.05 -> 0.02
+utd: 5 -> 2
+total_env_steps: 20000 -> 10000
+```
+
+更稳妥的下一组实验是保留 `stage1_goal_fixed/rl_token.pt`，重新跑 Stage 2：
+
+```text
+outputs/rlt_libero/stage2_goal_3_9_fixed_bc5_std002_utd2
+```
 
 # step 3: 量化部署
 ## step 3-1: baseline

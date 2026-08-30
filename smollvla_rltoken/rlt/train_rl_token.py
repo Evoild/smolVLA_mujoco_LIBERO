@@ -26,8 +26,8 @@ from .smolvla_compat import load_smolvla_policy
 
 
 SUITE_TASK_RANGES = {
-    "libero_goal": range(0, 10),
-    "libero_10": range(10, 20),
+    "libero_10": range(0, 10),
+    "libero_goal": range(10, 20),
     "libero_object": range(20, 30),
     "libero_spatial": range(30, 40),
 }

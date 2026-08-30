@@ -1,8 +1,9 @@
 """Chunk-level actor-critic for RLT (paper Sec. IV-B, Eq. 3-5, App. B).
 
-* Actor: Gaussian over action chunks with small fixed std, conditioned on the
-  RL state x = (z_rl, s^p) and the VLA reference chunk (pass-through), with
-  50% reference dropout during training (zeros on the input pathway only).
+* Actor: residual Gaussian over action chunks with small fixed std,
+  conditioned on the RL state x = (z_rl, s^p) and the VLA reference chunk. The
+  network predicts delta actions with zero-initialized output, so at
+  initialization mu(x, ref) = ref.
 * Critic: ensemble of two Q functions; TD3-style target networks, min over
   the ensemble for target values; chunk-level C-step backup.
 """
@@ -29,7 +30,7 @@ def _mlp(in_dim: int, hidden_dim: int, out_dim: int, n_layers: int) -> nn.Sequen
 
 
 class ChunkActor(nn.Module):
-    """pi_theta(a_{1:C} | x, a~_{1:C}) = N(mu_theta(x, a~), sigma^2 I)  (Eq. 4)."""
+    """pi_theta(a_{1:C} | x, a~_{1:C}) = N(a~ + delta_theta(x, a~), sigma^2 I)."""
 
     def __init__(self, cfg: ActorCriticConfig):
         super().__init__()
@@ -37,15 +38,35 @@ class ChunkActor(nn.Module):
         chunk_dim = cfg.chunk_len * cfg.action_dim
         in_dim = cfg.rl_token_dim + cfg.proprio_dim + chunk_dim
         self.net = _mlp(in_dim, cfg.hidden_dim, chunk_dim, cfg.n_layers)
+        self._zero_init_output()
 
-    def mu(self, x: Tensor, ref_chunk: Tensor) -> Tensor:
+    def _zero_init_output(self) -> None:
+        last = self.net[-1]
+        if not isinstance(last, nn.Linear):
+            raise TypeError("ChunkActor expects the final layer to be nn.Linear")
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+
+    def delta(self, x: Tensor, ref_chunk_input: Tensor) -> Tensor:
         """x: (B, rl_token_dim + proprio_dim); ref_chunk: (B, C, d) or zeros."""
-        ref_flat = ref_chunk.reshape(ref_chunk.shape[0], -1)
+        ref_flat = ref_chunk_input.reshape(ref_chunk_input.shape[0], -1)
         out = self.net(torch.cat([x, ref_flat], dim=-1))
         return out.reshape(-1, self.cfg.chunk_len, self.cfg.action_dim)
 
-    def sample(self, x: Tensor, ref_chunk: Tensor, deterministic: bool = False) -> Tensor:
-        mu = self.mu(x, ref_chunk)
+    def mu(self, x: Tensor, ref_chunk: Tensor, ref_chunk_input: Tensor | None = None) -> Tensor:
+        """Residual action mean; dropout may affect the input but not the skip."""
+        if ref_chunk_input is None:
+            ref_chunk_input = ref_chunk
+        return ref_chunk + self.delta(x, ref_chunk_input)
+
+    def sample(
+        self,
+        x: Tensor,
+        ref_chunk: Tensor,
+        deterministic: bool = False,
+        ref_chunk_input: Tensor | None = None,
+    ) -> Tensor:
+        mu = self.mu(x, ref_chunk, ref_chunk_input=ref_chunk_input)
         if deterministic:
             return mu
         return mu + self.cfg.action_std * torch.randn_like(mu)
@@ -122,7 +143,7 @@ class RLTAgent:
             # a' ~ pi_theta(. | x', a~'); dropout also applies here so the
             # policy used in the backup matches the trained one in expectation.
             ref_in = self.actor.apply_ref_dropout(ref_next)
-            a_next = self.actor.sample(x_next, ref_in)
+            a_next = self.actor.sample(x_next, ref_next, ref_chunk_input=ref_in)
             q_next = self.critic_target.min_q(x_next, a_next)
             gamma_c = cfg.discount ** cfg.ac.chunk_len
             target = r + gamma_c * (1.0 - done) * q_next
@@ -153,7 +174,7 @@ class RLTAgent:
         # Reference dropout on the input pathway only (Eq. 5 still uses the
         # true reference as the BC target).
         ref_in = self.actor.apply_ref_dropout(ref)
-        mu = self.actor.mu(x, ref_in)
+        mu = self.actor.mu(x, ref, ref_chunk_input=ref_in)
         a = mu + cfg.ac.action_std * torch.randn_like(mu)  # reparameterized
 
         q = self.critic.min_q(x, a)
@@ -168,6 +189,8 @@ class RLTAgent:
             "actor_loss": actor_loss.item(),
             "actor_q": q.mean().item(),
             "bc_dist": bc.mean().item(),
+            "delta_l2": (mu - ref).norm(dim=-1).mean().item(),
+            "actor_ref_l2": (a - ref).norm(dim=-1).mean().item(),
         }
 
     def update(self, sample_batch_fn) -> dict[str, float]:

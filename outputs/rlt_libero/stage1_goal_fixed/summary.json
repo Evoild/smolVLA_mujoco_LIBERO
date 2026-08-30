@@ -1,0 +1,25 @@
+{
+  "checkpoint": "/home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero",
+  "dataset": "HuggingFaceVLA/libero",
+  "dataset_root": "/home/evoild/program/smolVLA_mujoco_LIBERO/libero",
+  "dataset_suite": "libero_goal",
+  "dataset_task_indices": [
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "elapsed_s": 1229.7804141044617,
+  "gpu_peak_mem_mb": 1761.91552734375,
+  "out": "/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed",
+  "steps": 5000,
+  "tensorboard_dir": "/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/tensorboard",
+  "train_episodes": 385,
+  "val_episodes": 43
+}

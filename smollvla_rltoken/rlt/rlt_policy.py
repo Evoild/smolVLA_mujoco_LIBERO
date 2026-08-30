@@ -86,4 +86,11 @@ class RLTController:
         else:
             action_chunk = ref_chunk
 
-        return {"x": x, "ref_full": ref_full, "action_chunk": action_chunk}
+        delta = action_chunk - ref_chunk
+        return {
+            "x": x,
+            "ref_full": ref_full,
+            "action_chunk": action_chunk,
+            "delta_l2": delta.norm(dim=-1).mean(),
+            "actor_ref_l2": delta.norm(dim=-1).mean(),
+        }

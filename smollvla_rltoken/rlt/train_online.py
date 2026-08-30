@@ -17,6 +17,7 @@ Example (mock env smoke run):
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -31,6 +32,19 @@ from .replay_buffer import ChunkRecord, ChunkReplayBuffer
 from .rl_token import RLTokenModule
 from .rlt_policy import RLTController
 from .smolvla_compat import load_smolvla_policy
+
+
+def _parse_task_ids(task_ids: str | None) -> list[int] | None:
+    if task_ids is None or task_ids.strip() == "":
+        return None
+    parsed = []
+    for raw in task_ids.split(","):
+        raw = raw.strip()
+        if raw:
+            parsed.append(int(raw))
+    if not parsed:
+        return None
+    return parsed
 
 
 def load_rl_token(path: str | Path, device: str) -> tuple[RLTokenModule, RLTokenConfig]:
@@ -56,6 +70,7 @@ class RolloutWorker:
         self.obs = None
         self.ep_steps = 0
         self.ep_return = 0.0
+        self.last_plan_metrics: dict[str, float] = {}
 
     def reset(self) -> None:
         self.obs = self.env.reset()
@@ -71,6 +86,10 @@ class RolloutWorker:
         c = self.controller.chunk_len
         batch = self.env.obs_to_batch([self.obs], self.device)
         plan = self.controller.plan_chunk(batch, use_actor=use_actor, deterministic=deterministic)
+        self.last_plan_metrics = {
+            "rollout_delta_l2": float(plan["delta_l2"].detach().cpu()),
+            "rollout_actor_ref_l2": float(plan["actor_ref_l2"].detach().cpu()),
+        }
 
         intervention = self.env.get_intervention()
         if intervention is not None:
@@ -123,6 +142,65 @@ class RolloutWorker:
         return n_steps, env_done or truncated, success
 
 
+class MultiTaskLiberoChunkEnv:
+    """Cycles LIBERO single-task envs at episode boundaries."""
+
+    def __init__(self, task_ids: list[int], **env_kwargs):
+        if not task_ids:
+            raise ValueError("MultiTaskLiberoChunkEnv requires at least one task id")
+        self.task_ids = [int(t) for t in task_ids]
+        self.env_kwargs = env_kwargs
+        self._task_cursor = -1
+        self._env: LiberoChunkEnv | None = None
+        self.task_id = self.task_ids[0]
+
+    def _make_env(self, task_id: int) -> LiberoChunkEnv:
+        kwargs = dict(self.env_kwargs)
+        kwargs["task_id"] = task_id
+        return LiberoChunkEnv(**kwargs)
+
+    def reset(self) -> dict:
+        self._task_cursor = (self._task_cursor + 1) % len(self.task_ids)
+        next_task_id = self.task_ids[self._task_cursor]
+        if self._env is None or self.task_id != next_task_id:
+            if self._env is not None:
+                self._env.close()
+            self._env = self._make_env(next_task_id)
+            self.task_id = next_task_id
+        return self._env.reset()
+
+    def obs_to_batch(self, obs_list: list[dict], device):
+        return self._require_env().obs_to_batch(obs_list, device)
+
+    def step(self, action):
+        return self._require_env().step(action)
+
+    def get_intervention(self):
+        return self._require_env().get_intervention()
+
+    @property
+    def max_episode_steps(self) -> int:
+        return self._require_env().max_episode_steps
+
+    @property
+    def last_success(self) -> bool:
+        return self._require_env().last_success
+
+    @property
+    def last_info(self) -> dict:
+        return self._require_env().last_info
+
+    def _require_env(self) -> LiberoChunkEnv:
+        if self._env is None:
+            raise RuntimeError("environment is not initialized; call reset() first")
+        return self._env
+
+    def close(self) -> None:
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+
+
 def train(args):
     device = args.device
     cfg = OnlineRLConfig(
@@ -164,8 +242,9 @@ def train(args):
         num_inference_steps=args.num_inference_steps,
     )
 
+    selected_task_ids = _parse_task_ids(args.libero_task_ids)
     if args.libero_env:
-        env = LiberoChunkEnv(
+        libero_env_kwargs = dict(
             policy=policy,
             checkpoint=args.checkpoint,
             suite_name=args.libero_suite,
@@ -178,6 +257,11 @@ def train(args):
             observation_height=args.libero_observation_height,
             observation_width=args.libero_observation_width,
         )
+        if selected_task_ids is not None:
+            libero_env_kwargs.pop("task_id")
+            env = MultiTaskLiberoChunkEnv(selected_task_ids, **libero_env_kwargs)
+        else:
+            env = LiberoChunkEnv(**libero_env_kwargs)
     elif args.mock_env:
         env = MockManipEnv(
             action_dim=cfg.ac.action_dim,
@@ -204,6 +288,7 @@ def train(args):
     updates_per_chunk = cfg.utd * (cfg.ac.chunk_len // cfg.subsample_stride)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = out_dir / "metrics.jsonl"
 
     env_steps, episodes, ep_results = 0, 0, []
     worker.reset()
@@ -219,6 +304,18 @@ def train(args):
         if ep_done:
             episodes += 1
             ep_results.append(1.0 if ep_success else 0.0)
+            ep_log = {
+                "event": "episode",
+                "episode": episodes,
+                "env_steps": env_steps,
+                "task_id": int(getattr(env, "task_id", args.libero_task_id)),
+                "return": float(worker.ep_return),
+                "success": bool(ep_success),
+                "buffer_size": len(buffer),
+                **worker.last_plan_metrics,
+            }
+            with metrics_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(ep_log, sort_keys=True) + "\n")
             worker.reset()
 
         if not warmup and len(buffer) >= cfg.batch_size:
@@ -232,14 +329,42 @@ def train(args):
             m = " ".join(f"{k}={v:.4f}" for k, v in metrics.items())
             print(
                 f"[stage2] steps={env_steps} eps={episodes} buffer={len(buffer)} "
+                f"task={getattr(env, 'task_id', args.libero_task_id)} "
                 f"success20={sr:.2f} {m} ({speed:.1f} steps/s)",
                 flush=True,
             )
+            step_log = {
+                "event": "train",
+                "env_steps": env_steps,
+                "episodes": episodes,
+                "task_id": int(getattr(env, "task_id", args.libero_task_id)),
+                "buffer_size": len(buffer),
+                "success20": sr,
+                "steps_per_sec": speed,
+                **worker.last_plan_metrics,
+                **metrics,
+            }
+            with metrics_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(step_log, sort_keys=True) + "\n")
 
         if env_steps // args.save_freq != prev_steps // args.save_freq:
             torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
 
     torch.save(agent.state_dict(), out_dir / "rlt_agent.pt")
+    summary = {
+        "checkpoint": args.checkpoint,
+        "rl_token": args.rl_token,
+        "out": str(out_dir),
+        "env_steps": env_steps,
+        "episodes": episodes,
+        "success_rate": sum(ep_results) / max(len(ep_results), 1),
+        "libero_suite": args.libero_suite,
+        "libero_task_ids": selected_task_ids or [args.libero_task_id],
+        "warmup_env_steps": cfg.warmup_env_steps,
+        "total_env_steps": cfg.total_env_steps,
+        "elapsed_s": time.time() - t0,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(f"[stage2] done; {episodes} episodes, saved to {out_dir/'rlt_agent.pt'}")
     if hasattr(env, "close"):
         env.close()
@@ -256,6 +381,7 @@ def main():
     p.add_argument("--libero-env", action="store_true")
     p.add_argument("--libero-suite", default="libero_spatial")
     p.add_argument("--libero-task-id", type=int, default=0)
+    p.add_argument("--libero-task-ids", default=None, help="Comma-separated LIBERO task ids cycled per episode.")
     p.add_argument("--libero-control-mode", default="relative", choices=["relative", "absolute"])
     p.add_argument("--libero-no-init-states", action="store_true")
     p.add_argument("--libero-observation-height", type=int, default=360)

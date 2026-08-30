@@ -1,0 +1,16 @@
+{
+  "checkpoint": "/home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero",
+  "elapsed_s": 608.8203167915344,
+  "env_steps": 20004,
+  "episodes": 83,
+  "libero_suite": "libero_goal",
+  "libero_task_ids": [
+    3,
+    9
+  ],
+  "out": "/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage2_goal_3_9",
+  "rl_token": "/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal/rl_token.pt",
+  "success_rate": 0.6506024096385542,
+  "total_env_steps": 20000,
+  "warmup_env_steps": 2000
+}

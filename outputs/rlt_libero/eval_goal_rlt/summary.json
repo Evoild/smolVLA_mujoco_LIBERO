@@ -1,0 +1,25 @@
+{
+  "agent": "/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage2_goal_3_9_fixed/rlt_agent.pt",
+  "checkpoint": "/home/evoild/program/smolVLA_mujoco_LIBERO/smolvla_libero",
+  "elapsed_s": 3462.7918593883514,
+  "episodes": 1000,
+  "episodes_per_task": 100,
+  "mode": "rlt_actor",
+  "out": "/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/eval_goal_rlt",
+  "rl_token": "/home/evoild/program/smolVLA_mujoco_LIBERO/outputs/rlt_libero/stage1_goal_fixed/rl_token.pt",
+  "success_rate_pct": 76.3,
+  "successes": 763,
+  "suite": "libero_goal",
+  "task_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ]
+}

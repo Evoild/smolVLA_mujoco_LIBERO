@@ -1,0 +1,11 @@
+suite,task_id,task,successes,episodes,success_rate_pct,mode
+libero_goal,0,open the middle drawer of the cabinet,80,100,80.0,rlt_actor
+libero_goal,1,put the bowl on the stove,95,100,95.0,rlt_actor
+libero_goal,2,put the wine bottle on top of the cabinet,85,100,85.0,rlt_actor
+libero_goal,3,open the top drawer and put the bowl inside,37,100,37.0,rlt_actor
+libero_goal,4,put the bowl on top of the cabinet,93,100,93.0,rlt_actor
+libero_goal,5,push the plate to the front of the stove,84,100,84.0,rlt_actor
+libero_goal,6,put the cream cheese in the bowl,86,100,86.0,rlt_actor
+libero_goal,7,turn on the stove,97,100,97.0,rlt_actor
+libero_goal,8,put the bowl on the plate,75,100,75.0,rlt_actor
+libero_goal,9,put the wine bottle on the rack,31,100,31.0,rlt_actor
